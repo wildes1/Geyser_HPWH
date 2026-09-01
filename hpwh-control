@@ -1,0 +1,753 @@
+# Heat Pump Water Heater control
+# Replaces control board in a Geyser 6000-3.0 
+# uses one 30A relay and 2-10A relays to control fan, recirc pump and compressor respectively, 
+# electric water heater element control not replicated.
+# PZEM-004T V2 Energy monitor measures compressor voltage, current power
+# Taco 006-BZ4 cartridge circulator, about 8 cfm with 4' head
+# 6 temperarture sensors, evap, water out, internal water out, internal water in, tank top and tank bottom
+# COP calculated with internal_water_in_temp, internal_water_out_temp, compressor_power and flow_rate of 8cfm (adjustable)
+
+
+esphome:
+  name: hpwh-control
+
+esp32:
+  board: nodemcu-32s
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "HPWC Control Fallback Hotspot"
+    password: !secret backup_wifi_pw
+    
+  domain: .wilde
+
+captive_portal:
+
+# Enable logging
+logger:
+  level: DEBUG
+  
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret encryption_pw
+
+ota:
+  - platform: esphome
+    password: !secret ota_pw
+
+esp32_ble_tracker:
+
+bluetooth_proxy:
+  active: true
+
+globals:
+  - id: dallas_power_override
+    type: bool
+    restore_value: yes
+    initial_value: "true"
+
+  - id: last_evap_temp
+    type: float
+    restore_value: no
+    initial_value: "25"
+
+  - id: last_water_out_temp
+    type: float
+    restore_value: no
+    initial_value: "25"
+
+  - id: last_internal_water_out_temp
+    type: float
+    restore_value: no
+    initial_value: "25"
+
+  - id: last_internal_water_in_temp
+    type: float
+    restore_value: no
+    initial_value: "25"
+
+  - id: last_top
+    type: float
+    restore_value: no
+    initial_value: "25"
+
+  - id: last_bot
+    type: float
+    restore_value: no
+    initial_value: "25"
+
+  - id: hpwh_state
+    type: int
+    restore_value: no
+    initial_value: "0"  # 0=IDLE,1=HEATING_CALL,2=DEFROST,3=COOLDOWN,4=FAULT
+
+  - id: defrost_fault_flag
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: last_compressor_on_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: last_compressor_off_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: defrost_start_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: hpwh_last_event_str
+    type: std::string
+    restore_value: no
+    initial_value: "\"INIT\""
+
+  - id: hpwh_fault_auto_restart_flag
+    type: bool
+    restore_value: yes
+    initial_value: "true"
+    
+uart:
+  tx_pin: GPIO17
+  rx_pin: GPIO16
+  baud_rate: 9600
+  stop_bits: 2  
+  
+switch:
+  - platform: template
+    name: "Dallas Power Override"
+    id: dallas_power_override_sw
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(dallas_power_override) = true;
+      - switch.turn_on: dallas_sw
+    turn_off_action:
+      - lambda: |-
+          id(dallas_power_override) = false;
+      # Do NOT turn off dallas_sw here — interval logic will handle it
+    lambda: |-
+      return id(dallas_power_override);
+
+  - platform: gpio
+    name: "Fan"
+    id: fan
+    pin: GPIO2 #10A red output 2
+    
+  - platform: gpio
+    name: "Pump"
+    id: pump
+    pin: GPIO4  #10A red output 1
+
+  - platform: gpio
+    name: "Compressor"
+    id: compressor
+    pin: GPIO12  #30A green pcb
+    
+  - platform: gpio
+    pin: GPIO27
+    id: dallas_sw
+    name: "Dallas Sensor Power"
+    restore_mode: ALWAYS_ON
+
+  - platform: gpio
+    pin: GPIO26
+    id: dallas_sw2
+    name: "Dallas Sensor Power 2"
+    restore_mode: ALWAYS_ON
+
+  - platform: template
+    name: "HPWH Enable"
+    id: hpwh_enable
+    optimistic: true
+    turn_on_action: []
+    turn_off_action:
+      - script.execute: hpwh_shutdown_sequence
+
+  - platform: template
+    name: "HPWH Fault Auto-Restart"
+    id: hpwh_fault_auto_restart
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(hpwh_fault_auto_restart_flag) = true;
+    turn_off_action:
+      - lambda: |-
+          id(hpwh_fault_auto_restart_flag) = false;
+    lambda: |-
+      return id(hpwh_fault_auto_restart_flag);
+
+  - platform: template
+    name: "HPWH Heat Request"
+    id: hpwh_heat_request
+    turn_on_action:
+      # 1. Check HPWH enable first
+      - if:
+          condition:
+            switch.is_on: hpwh_enable
+          then:
+            # 2. Check minimum off-time
+            - if:
+                condition:
+                  lambda: |-
+                    const uint32_t now = millis();
+                    const uint32_t last_off = id(last_compressor_off_ms);
+                    const float min_off_min = id(min_heating_off_time).state;
+    
+                    // If never run before, allow start
+                    if (last_off == 0) return true;
+    
+                    // Enforce min off-time
+                    return (now - last_off) >= (uint32_t)(min_off_min * 60 * 1000);
+                then:
+                  # 3. All conditions satisfied → start heating
+                  - script.execute: hpwh_start_heat_call
+                else:
+                  - logger.log: "Heat request suppressed: min off-time not satisfied"
+          else:
+            - logger.log: "Heat request ignored: HPWH disabled"
+
+    turn_off_action:
+      # 1. Only proceed if HPWH is enabled
+      - if:
+          condition:
+            switch.is_on: hpwh_enable
+          then:
+            # 2. Check minimum run-time
+            - if:
+                condition:
+                  lambda: |-
+                    const uint32_t now = millis();
+                    const uint32_t last_on = id(last_compressor_on_ms);
+                    const float min_run_min = id(min_heating_run_time).state;
+    
+                    // If compressor never ran, allow shutdown
+                    if (last_on == 0) return true;
+    
+                    // Enforce minimum run-time
+                    return (now - last_on) >= (uint32_t)(min_run_min * 60 * 1000);
+                then:
+                  # 3. All conditions satisfied → stop heating
+                  - script.execute: hpwh_stop_heat_call
+                else:
+                  - logger.log: "Stop request suppressed: min run-time not satisfied"
+          else:
+            - logger.log: "Stop request ignored: HPWH disabled"
+
+binary_sensor:
+  - platform: template
+    name: "HPWH Top Sensor Fault"
+    id: hpwh_top_sensor_fault
+    lambda: |-
+      return isnan(id(top_wh_temperature).state);
+
+  - platform: template
+    name: "HPWH Evap Sensor Fault"
+    id: hpwh_evap_sensor_fault
+    lambda: |-
+      return isnan(id(evap_temp).state);
+
+  - platform: template
+    name: "HPWH Defrost Fault"
+    id: hpwh_defrost_fault
+    lambda: |-
+      return id(defrost_fault_flag);
+
+  - platform: template
+    name: "HPWH Overpower Fault"
+    id: hpwh_overpower_fault
+    lambda: |-
+      return id(hpwh_last_event_str) == "OVERPOWER FAULT";
+      
+  - platform: template
+    name: "HPWH General Fault"
+    id: hpwh_fault
+    lambda: |-
+      return id(hpwh_top_sensor_fault).state ||
+             id(hpwh_evap_sensor_fault).state ||
+             id(hpwh_defrost_fault).state ||
+             id(hpwh_overpower_fault).state;
+
+text_sensor:
+  - platform: template
+    name: "HPWH Mode"
+    id: hpwh_mode
+    update_interval: 5s
+    lambda: |-
+      switch (id(hpwh_state)) {
+        case 0: return {"IDLE"};
+        case 1: return {"HEATING_CALL"};
+        case 2: return {"DEFROST"};
+        case 3: return {"COOLDOWN"};
+        case 4: return {"FAULT"};
+        default: return {"UNKNOWN"};
+      }
+
+  - platform: template
+    name: "HPWH Last Event"
+    id: hpwh_last_event
+    update_interval: 10s
+    lambda: |-
+      return id(hpwh_last_event_str);
+      
+# Example configuration entry
+one_wire:
+  - platform: gpio
+    pin: GPIO15
+
+# Individual sensors
+sensor:
+  - platform: pzem004t
+    voltage:
+      name: "Compressor Voltage"
+      id: compressor_voltage
+    current:
+      name: "Compressor Current"
+      id: compressor_current
+    power:
+      name: "Compressor Power"
+      id: compressor_power
+    energy:
+      name: "Compressor Energy"
+      id: compressor_energy
+      
+  - platform: wifi_signal
+    name: "WiFi Signal Sensor"
+    id: wifi_signal_level
+    update_interval: 60s
+
+  - platform: dallas_temp
+    address: 0x580000006bc73428
+    name: "Evaporator Temp"
+    id: evap_temp
+    filters:
+      - lambda: |-
+          if (x > 84.0)   // 84°C → 29°C
+            x = id(last_evap_temp);
+          else
+            id(last_evap_temp) = x;
+          return x;
+    unit_of_measurement: "°C"
+    update_interval: never
+
+  - platform: dallas_temp
+    address: 0x8b000000cad33d28
+    name: "Water Output Temp"
+    id: water_out_temp
+    filters:
+      - lambda: |-
+          if (x > 84.0)
+            x = id(last_water_out_temp);
+          else
+            id(last_water_out_temp) = x;
+          return x;
+    unit_of_measurement: "°C"
+    update_interval: never
+
+  - platform: dallas_temp
+    address: 0xb900000000db6d28
+    name: "Internal Water Output Temp"
+    id: internal_water_out_temp
+    filters:
+      - lambda: |-
+          if (x > 84.0)
+            x = id(last_internal_water_out_temp);
+          else
+            id(last_internal_water_out_temp) = x;
+          return x;
+    unit_of_measurement: "°C"
+    update_interval: never
+
+  - platform: dallas_temp
+    address: 0xd80000006b942428
+    name: "Internal Water In Temp"
+    id: internal_water_in_temp
+    filters:
+      - lambda: |-
+          if (x > 84.0)
+            x = id(last_internal_water_in_temp);
+          else
+            id(last_internal_water_in_temp) = x;
+          return x;
+    unit_of_measurement: "°C"
+    update_interval: never
+
+  - platform: dallas_temp
+    address: 0x24011312DD48AA28
+    name: "Top WH Temperature"
+    id: top_wh_temperature
+    filters:
+      - lambda: |-
+          if (x > 84.0)
+            x = id(last_top);
+          else
+            id(last_top) = x;
+          return x;
+    unit_of_measurement: "°C"
+    update_interval: never
+
+  - platform: dallas_temp
+    address: 0x0B011312CBFFAA28
+    name: "Bottom WH Temperature"
+    id: bottom_wh_temperature
+    filters:
+      - lambda: |-
+          if (x > 84.0)
+            x = id(last_bot);
+          else
+            id(last_bot) = x;
+          return x;
+    unit_of_measurement: "°C"
+    update_interval: never
+
+  - platform: template
+    name: "HPWH COP"
+    id: hpwh_cop
+    unit_of_measurement: "COP"
+    update_interval: 10s
+    lambda: |-
+      const float Tin  = id(internal_water_in_temp).state;
+      const float Tout = id(internal_water_out_temp).state;
+      const float P    = id(compressor_power).state;  // watts
+      const float flow = id(hpwh_flow_rate).state;    // CFM
+
+      if (isnan(Tin) || isnan(Tout) || isnan(P) || isnan(flow) || P <= 0) {
+        return 0;
+      }
+
+      const float deltaT = Tout - Tin;  // °C
+      const float mass_flow = flow * 0.472;  // kg/s (CFM → L/s → kg/s)
+      const float cp = 4184.0;  // J/kg·°C
+
+      const float useful_heat = mass_flow * cp * deltaT;  // watts
+      return useful_heat / P;
+
+    
+climate:
+  - platform: bang_bang
+    name: "HPWH Climate"
+    id: hpwh_climate
+    sensor: top_wh_temperature
+    default_target_temperature_low: 48.9
+    default_target_temperature_high: 48.9
+    visual:
+      min_temperature: 40.6
+      max_temperature: 80.0
+      temperature_step: 0.5
+    heat_action:
+      - switch.turn_on: hpwh_heat_request
+    idle_action:
+      - switch.turn_off: hpwh_heat_request
+
+number:
+  - platform: template
+    name: "HPWH Flow Rate"
+    id: hpwh_flow_rate
+    min_value: 1.0
+    max_value: 11.0
+    step: 0.1
+    unit_of_measurement: "CFM"
+    initial_value: 8.0
+    optimistic: true
+    
+  - platform: template
+    name: "HPWH Defrost Start Temp"
+    id: defrost_start_temp
+    min_value: -10.0
+    max_value: 20.0
+    step: 0.1
+    initial_value: 1.7
+    optimistic: true
+
+  - platform: template
+    name: "HPWH Defrost End Temp"
+    id: defrost_end_temp
+    min_value: -10.0
+    max_value: 20.0
+    step: 0.1
+    initial_value: 4.4
+    optimistic: true
+
+  - platform: template
+    name: "HPWH Min Defrost Time"
+    id: min_defrost_time
+    min_value: 1.0
+    max_value: 30.0
+    step: 1.0
+    unit_of_measurement: "min"
+    initial_value: 2.0
+    optimistic: true
+
+  - platform: template
+    name: "HPWH Compressor Lockout Time"
+    id: compressor_lockout_time
+    min_value: 1.0
+    max_value: 30.0
+    step: 1.0
+    unit_of_measurement: "min"
+    initial_value: 2.0
+    optimistic: true
+
+  - platform: template
+    name: "HPWH Short Delay"
+    id: short_delay
+    min_value: 0.5
+    max_value: 10.0
+    step: 0.5
+    unit_of_measurement: "s"
+    initial_value: 1.0
+    optimistic: true
+
+  - platform: template
+    name: "HPWH Purge Delay"
+    id: purge_delay
+    min_value: 10.0
+    max_value: 300.0
+    step: 5.0
+    unit_of_measurement: "s"
+    initial_value: 60.0
+    optimistic: true
+
+  - platform: template
+    name: "HPWH Max Compressor Runtime"
+    id: max_compressor_runtime
+    min_value: 30.0
+    max_value: 240.0
+    step: 30.0
+    unit_of_measurement: "min"
+    initial_value: 240.0
+    optimistic: true
+
+  - platform: template
+    name: "HPWH Min Heating Run Time"
+    id: min_heating_run_time
+    min_value: 1.0
+    max_value: 30.0
+    step: 1.0
+    unit_of_measurement: "min"
+    initial_value: 10.0
+    optimistic: true
+
+  - platform: template
+    name: "HPWH Min Heating Off Time"
+    id: min_heating_off_time
+    min_value: 1.0
+    max_value: 30.0
+    step: 1.0
+    unit_of_measurement: "min"
+    initial_value: 2.0
+    optimistic: true
+    
+script:
+  - id: hpwh_start_heat_call
+    then:
+      - lambda: |-
+          id(hpwh_state) = 1;
+          id(hpwh_last_event_str) = "ENTER HEATING_CALL";
+          ESP_LOGD("hpwh", "Entering HEATING_CALL");
+      - switch.turn_on: pump
+      - delay: !lambda "return (uint32_t)(id(short_delay).state * 1000);"
+      - switch.turn_on: fan
+      - delay: !lambda "return (uint32_t)(id(short_delay).state * 1000);"
+      - switch.turn_on: compressor
+      - lambda: |-
+          id(last_compressor_on_ms) = millis();
+
+  - id: hpwh_stop_heat_call
+    then:
+      - lambda: |-
+          if (id(hpwh_state) == 2) {
+            // in DEFROST: don't stop fan/pump yet, just ensure compressor off
+            ESP_LOGD("hpwh", "Stop heat requested during DEFROST: compressor off only");
+          }
+      - switch.turn_off: compressor
+      - lambda: |-
+          id(last_compressor_off_ms) = millis();
+          id(hpwh_state) = 3;
+          id(hpwh_last_event_str) = "ENTER COOLDOWN";
+          ESP_LOGD("hpwh", "Entering COOLDOWN");
+      - delay: !lambda "return (uint32_t)(id(purge_delay).state * 1000);"
+      - switch.turn_off: pump
+      - delay: !lambda "return (uint32_t)(id(short_delay).state * 1000);"
+      - switch.turn_off: fan
+      - lambda: |-
+          if (!id(hpwh_fault).state) {
+            id(hpwh_state) = 0;
+            id(hpwh_last_event_str) = "ENTER IDLE";
+            ESP_LOGD("hpwh", "Entering IDLE");
+          }
+
+  - id: hpwh_shutdown_sequence
+    then:
+      - logger.log: "HPWH shutdown requested from HA"
+      - script.execute: hpwh_stop_heat_call
+
+  - id: hpwh_enter_defrost
+    then:
+      - lambda: |-
+          id(hpwh_state) = 2;
+          id(hpwh_last_event_str) = "ENTER DEFROST";
+          ESP_LOGD("hpwh", "Entering DEFROST");
+          id(defrost_start_ms) = millis();
+      - switch.turn_off: compressor
+      - lambda: |-
+          id(last_compressor_off_ms) = millis();
+      - switch.turn_on: pump
+      - switch.turn_on: fan
+
+  - id: hpwh_exit_defrost
+    then:
+      - lambda: |-
+          ESP_LOGD("hpwh", "Exiting DEFROST");
+
+      - if:
+          condition:
+            switch.is_on: hpwh_heat_request
+          then:
+            - lambda: |-
+                ESP_LOGD("hpwh", "Heat still requested → resuming HEATING_CALL");
+                id(hpwh_state) = 1;  // HEATING_CALL
+            - switch.turn_on: compressor
+          else:
+            - lambda: |-
+                ESP_LOGD("hpwh", "No heat request → entering COOLDOWN");
+            - script.execute: hpwh_stop_heat_call
+      
+   
+# Run temp sensors every minute (one of the WH sensors fails every few days)...
+interval:
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(dallas_power_override);'
+          then:
+            - switch.turn_on: dallas_sw
+            - switch.turn_on: dallas_sw2
+            - delay: 5s
+            - component.update: evap_temp
+            - delay: 1s
+            - component.update: internal_water_in_temp
+            - delay: 1s
+            - component.update: internal_water_out_temp
+            - delay: 1s
+            - component.update: water_out_temp
+            - delay: 1s
+            - component.update: top_wh_temperature
+            - delay: 1s
+            - component.update: bottom_wh_temperature
+            - delay: 1s
+            - switch.turn_off: dallas_sw
+            - switch.turn_off: dallas_sw2
+            # - switch.turn_on: dallas_sw
+          else:
+            # Override ON → keep power ON and just update sensors
+            - switch.turn_on: dallas_sw
+            - switch.turn_on: dallas_sw2
+            - component.update: evap_temp
+            - delay: 1s
+            - component.update: internal_water_in_temp
+            - delay: 1s
+            - component.update: internal_water_out_temp
+            - delay: 1s
+            - component.update: water_out_temp
+            - delay: 1s
+            - component.update: top_wh_temperature
+            - delay: 1s
+            - component.update: bottom_wh_temperature
+
+  - interval: 5s
+    then:
+      - lambda: |-
+          const float evap_f = id(evap_temp).state;
+          const float start_f = id(defrost_start_temp).state;
+          const float end_f   = id(defrost_end_temp).state;
+
+          const uint32_t now = millis();
+
+          // Compressor over-power protection
+          if (id(compressor).state) {
+            const float pwr = id(compressor_power).state;   // watts
+            const uint32_t now = millis();
+            const uint32_t on_ms = id(last_compressor_on_ms);
+          
+            if (!isnan(pwr) && pwr > 1100.0) {
+              if (on_ms > 0 && (now - on_ms) >= (uint32_t)(2 * 60 * 1000)) {
+                ESP_LOGW("hpwh", "Compressor over-power fault: %.1f W", pwr);
+                id(hpwh_last_event_str) = "OVERPOWER FAULT";
+                id(hpwh_state) = 4;  // FAULT
+                id(compressor).turn_off();
+                id(last_compressor_off_ms) = now;
+          
+                // Hard lockout: disable system until power cycle or manual toggle
+                id(hpwh_enable).turn_off();
+              }
+            }
+          }
+
+          // Max compressor runtime supervision
+          if (id(compressor).state) {
+            const float max_min = id(max_compressor_runtime).state;
+            if (max_min > 0 && id(last_compressor_on_ms) > 0 &&
+                (now - id(last_compressor_on_ms)) >= (uint32_t)(max_min * 60 * 1000)) {
+              ESP_LOGW("hpwh", "Max compressor runtime exceeded");
+              id(hpwh_last_event_str) = "MAX RUNTIME FAULT";
+              id(hpwh_state) = 4;
+              if (id(hpwh_fault_auto_restart).state) {
+                // soft fault: stop, cooldown, then auto restart after 30 min
+                id(defrost_fault_flag) = false;
+                id(last_compressor_off_ms) = now;
+                id(hpwh_last_event_str) = "SOFT FAULT COOLDOWN";
+                id(hpwh_state) = 3;
+                id(compressor).turn_off();
+              } else {
+                // hard fault: stop and stay in FAULT
+                id(compressor).turn_off();
+              }
+            }
+          }
+
+          // Defrost trigger
+          if (id(hpwh_state) == 1 && id(compressor).state) {
+            if (!isnan(evap_f) && evap_f < start_f) {
+              ESP_LOGD("hpwh", "Defrost trigger: evap=%.1fF < %.1fF", evap_f, start_f);
+              id(hpwh_last_event_str) = "DEFROST TRIGGER";
+              id(defrost_fault_flag) = false;
+              id(hpwh_enter_defrost).execute();
+            }
+          }
+
+          // Defrost exit conditions
+          if (id(hpwh_state) == 2) {
+            const float min_def_min = id(min_defrost_time).state;
+            const float lock_min    = id(compressor_lockout_time).state;
+            const float min_total   = (min_def_min > lock_min) ? min_def_min : lock_min;
+
+            const uint32_t elapsed_ms = now - id(defrost_start_ms);
+            const bool min_time_ok = elapsed_ms >= (uint32_t)(min_total * 60 * 1000);
+            const bool temp_ok = (!isnan(evap_f) && evap_f > end_f);
+            const bool timeout_30m = elapsed_ms >= (uint32_t)(30 * 60 * 1000);
+
+            if ((min_time_ok && temp_ok) || timeout_30m) {
+              if (!temp_ok && timeout_30m) {
+                // defrost failed to clear
+                ESP_LOGW("hpwh", "Defrost timeout without temp recovery");
+                id(defrost_fault_flag) = true;
+                id(hpwh_last_event_str) = "DEFROST FAULT";
+                id(hpwh_state) = 4;
+              }
+              id(hpwh_exit_defrost).execute();
+            }
+          }
+        
