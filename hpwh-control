@@ -567,25 +567,57 @@ script:
   - id: hpwh_stop_heat_call
     then:
       - lambda: |-
-          if (id(hpwh_state) == 2) {
-            // in DEFROST: don't stop fan/pump yet, just ensure compressor off
-            ESP_LOGD("hpwh", "Stop heat requested during DEFROST: compressor off only");
+          ESP_LOGD("hpwh", "Stop heat call");
+          const uint8_t st = id(hpwh_state);
+
+          if (st == 2) {
+            // DEFROST → simplified cooldown
+            ESP_LOGD("hpwh", "Stop heat during DEFROST → simplified COOLDOWN");
+            id(hpwh_state) = 3;  // COOLDOWN
+            id(hpwh_last_event_str) = "STOP HEAT DURING DEFROST";
+
+            // All OFF, just purge_delay, then IDLE (or FAULT if already set)
+            id(compressor).turn_off();
+            id(pump).turn_off();
+            id(fan).turn_off();
+
+          } else {
+            // Normal heating cooldown (HEATING_CALL or similar)
+            ESP_LOGD("hpwh", "Stop heat during normal HEATING → full COOLDOWN");
+            id(hpwh_state) = 3;  // COOLDOWN
+            id(hpwh_last_event_str) = "STOP HEAT COOLDOWN";
+
+            // Compressor OFF, pump/fan stay ON, then purge → pump OFF → short → fan OFF
+            id(compressor).turn_off();
           }
-      - switch.turn_off: compressor
-      - lambda: |-
-          id(last_compressor_off_ms) = millis();
-          id(hpwh_state) = 3;
-          id(hpwh_last_event_str) = "ENTER COOLDOWN";
-          ESP_LOGD("hpwh", "Entering COOLDOWN");
+
+      # Common cooldown timing
       - delay: !lambda "return (uint32_t)(id(purge_delay).state * 1000);"
-      - switch.turn_off: pump
-      - delay: !lambda "return (uint32_t)(id(short_delay).state * 1000);"
-      - switch.turn_off: fan
+
       - lambda: |-
-          if (!id(hpwh_fault).state) {
-            id(hpwh_state) = 0;
+          if (id(hpwh_state) == 3) {
+            // If we came from normal heating, pump was ON; from DEFROST, it's already OFF
+            ESP_LOGD("hpwh", "Cooldown purge complete");
+          }
+
+      - if:
+          condition:
+            lambda: 'return id(hpwh_state) == 3 && id(hpwh_last_event_str) == "STOP HEAT COOLDOWN";'
+          then:
+            # Normal heating cooldown: pump OFF → short_delay → fan OFF
+            - switch.turn_off: pump
+            - delay: !lambda "return (uint32_t)(id(short_delay).state * 1000);"
+            - switch.turn_off: fan
+
+      - lambda: |-
+          // Final state after cooldown
+          if (id(hpwh_fault).state) {
+            id(hpwh_state) = 4;  // FAULT
+            ESP_LOGD("hpwh", "Entering FAULT after COOLDOWN");
+          } else {
+            id(hpwh_state) = 0;  // IDLE
             id(hpwh_last_event_str) = "ENTER IDLE";
-            ESP_LOGD("hpwh", "Entering IDLE");
+            ESP_LOGD("hpwh", "Entering IDLE after COOLDOWN");
           }
 
   - id: hpwh_shutdown_sequence
@@ -596,14 +628,11 @@ script:
   - id: hpwh_enter_defrost
     then:
       - lambda: |-
-          id(hpwh_state) = 2;
-          id(hpwh_last_event_str) = "ENTER DEFROST";
           ESP_LOGD("hpwh", "Entering DEFROST");
-          id(defrost_start_ms) = millis();
+          id(hpwh_state) = 2;  // DEFROST
+          id(hpwh_last_event_str) = "ENTER DEFROST";
       - switch.turn_off: compressor
-      - lambda: |-
-          id(last_compressor_off_ms) = millis();
-      - switch.turn_on: pump
+      - switch.turn_off: pump
       - switch.turn_on: fan
 
   - id: hpwh_exit_defrost
@@ -615,14 +644,33 @@ script:
           condition:
             switch.is_on: hpwh_heat_request
           then:
+            # Normal defrost exit: heat still requested
             - lambda: |-
                 ESP_LOGD("hpwh", "Heat still requested → resuming HEATING_CALL");
                 id(hpwh_state) = 1;  // HEATING_CALL
+                id(hpwh_last_event_str) = "DEFROST EXIT TO HEATING";
+
+            # Pump ON, then compressor ON after short_delay (lockout still enforced)
+            - switch.turn_on: pump
+            - delay: !lambda "return (uint32_t)(id(short_delay).state * 1000);"
             - switch.turn_on: compressor
+
           else:
+            # Defrost ends but no heat request → simplified cooldown
             - lambda: |-
-                ESP_LOGD("hpwh", "No heat request → entering COOLDOWN");
-            - script.execute: hpwh_stop_heat_call
+                ESP_LOGD("hpwh", "Defrost exit with no heat request → simplified COOLDOWN");
+                id(hpwh_state) = 3;  // COOLDOWN
+                id(hpwh_last_event_str) = "DEFROST EXIT TO COOLDOWN";
+
+            # All switches OFF, just purge_delay, then IDLE
+            - switch.turn_off: compressor
+            - switch.turn_off: pump
+            - switch.turn_off: fan
+            - delay: !lambda "return (uint32_t)(id(purge_delay).state * 1000);"
+            - lambda: |-
+                id(hpwh_state) = 0;  // IDLE
+                id(hpwh_last_event_str) = "ENTER IDLE";
+                ESP_LOGD("hpwh", "Entering IDLE after DEFROST COOLDOWN");
       
    
 # Run temp sensors every minute (one of the WH sensors fails every few days)...
