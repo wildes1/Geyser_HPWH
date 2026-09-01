@@ -1,8 +1,38 @@
-Heat Pump Water Heater control
-Replaces control board in a Geyser 6000-3.0 
-uses one 30A relay and 2-10A relays to control fan, recirc pump and compressor respectively, 
-electric water heater element control not replicated.
-PZEM-004T V2 Energy monitor measures compressor voltage, current power
-Taco 006-BZ4 cartridge circulator, about 8 cfm with 4' head
-6 temperature sensors, evap, water out, internal water out, internal water in, tank top and tank bottom
-COP calculated with internal_water_in_temp, internal_water_out_temp, compressor_power and flow_rate of 8cfm (adjustable)
+# Heat Pump Water Heater Control
+
+This project replaces the control board in a **Geyser 6000-3.0** heat pump water heater. It drops support for the electric water heater element.
+
+## Relays
+
+* **30A Relay:** Controls the compressor.
+* **10A Relay:** Controls the fan.
+* **10A Relay:** Controls the recirculating pump.
+
+## Energy Monitoring
+
+* **Sensor:** PZEM-004T V2 Energy Monitor.
+* **Metrics:** Compressor voltage, current, and power.
+
+## Plumbing & Flow
+
+* **Pump:** Taco 006-BZ4 cartridge circulator.
+* **Flow Rate:** ~8 CFM (equivalent to ~1 GPM / 60 GPH) at 4' head.
+* **Adjustment:** Flow rate variable is adjustable in software.
+
+## Temperature Sensors
+
+1. Evaporator
+2. Water Out
+3. Internal Water Out
+4. Internal Water In
+5. Tank Top
+6. Tank Bottom
+
+## COP Calculation
+
+Coefficient of Performance (COP) is calculated using the following inputs:
+
+* `internal_water_in_temp`
+* `internal_water_out_temp`
+* `compressor_power`
+* `flow_rate`
